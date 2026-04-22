@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-usage"
-version = "0.2.1"
+version = "0.3.0"
 description = "Parse local Claude Code logs, show token spend per session/project/model/day."
 readme = "README.md"
 requires-python = ">=3.10"

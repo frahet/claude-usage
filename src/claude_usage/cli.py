@@ -154,6 +154,44 @@ def color_for(cost: float, low: float = 1.0, mid: float = 5.0) -> str:
     return GREEN if cost < low else YELLOW if cost < mid else RED
 
 
+def session_state(last_ts, now_utc):
+    """Return (label, color, marker) based on time since last activity."""
+    if not last_ts:
+        return "DONE", DIM, " "
+    age = (now_utc - last_ts).total_seconds()
+    if age < 60:
+        return "LIVE", GREEN, f"{GREEN}●{RESET}"
+    if age < 600:
+        return "IDLE", YELLOW, f"{YELLOW}●{RESET}"
+    return "DONE", DIM, " "
+
+
+def fmt_age(last_ts, now_utc) -> str:
+    """Human-readable time-since: '2s ago', '4m ago', '2h ago', '3d ago'."""
+    if not last_ts:
+        return "--"
+    age = int((now_utc - last_ts).total_seconds())
+    if age < 5:
+        return "just now"
+    if age < 60:
+        return f"{age}s ago"
+    if age < 3600:
+        return f"{age // 60}m ago"
+    if age < 86400:
+        return f"{age // 3600}h ago"
+    return f"{age // 86400}d ago"
+
+
+def fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    h, rem = divmod(s, 3600)
+    return f"{h}h {rem // 60}m"
+
+
 def cmd_today(args) -> None:
     today = date.today()
     rows = [r for r in scan(since=today, project_filter=args.project) if r[0] and r[0].date() == today]
@@ -200,18 +238,23 @@ def _render_dashboard(sessions: dict, recent: deque, today_total: float, watch_s
     print(f"  today: {col_total}{fmt_usd(today_total)}{RESET}    since watch start: {col_since}{fmt_usd(since_watch)}{RESET}")
     print()
 
-    active_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-    sorted_sess = sorted(sessions.items(), key=lambda kv: -kv[1]["total"])
+    now_utc = datetime.now(timezone.utc)
+    # Sort: LIVE first, then IDLE, then DONE; break ties by cost desc.
+    def sort_key(kv):
+        s = kv[1]
+        age = (now_utc - s["last_ts"]).total_seconds() if s["last_ts"] else 1e12
+        bucket = 0 if age < 60 else 1 if age < 600 else 2
+        return (bucket, -s["total"])
+    sorted_sess = sorted(sessions.items(), key=sort_key)
 
-    print(f"{BOLD}TOP SESSIONS TODAY{RESET}  {DIM}(● = active in last 60s){RESET}")
-    print(f"    {DIM}{'SESSION':<9} {'PROJECT':<34} {'MODEL':<7} {'CALLS':>6}  {'LAST':<8}  {'COST':>9}{RESET}")
+    print(f"{BOLD}TOP SESSIONS TODAY{RESET}  {DIM}(LIVE = active < 60s, IDLE = 1–10 min, DONE = > 10 min){RESET}")
+    print(f"    {DIM}{'STATUS':<7} {'SESSION':<9} {'PROJECT':<30} {'MODEL':<7} {'CALLS':>6}  {'LAST':<10}  {'COST':>9}{RESET}")
     for sid, s in sorted_sess[:8]:
-        active = s["last_ts"] and s["last_ts"] > active_cutoff
-        marker = f"{GREEN}●{RESET}" if active else " "
-        last_str = s["last_ts"].astimezone().strftime("%H:%M:%S") if s["last_ts"] else "--:--:--"
+        label, label_col, marker = session_state(s["last_ts"], now_utc)
+        age_str = fmt_age(s["last_ts"], now_utc)
         col = color_for(s["total"], 1, 5)
-        proj = s["project"][:33]
-        print(f"  {marker} {sid[:8]:<9} {proj:<34} {s['model']:<7} {s['calls']:>6,}  {last_str:<8}  {col}{fmt_usd(s['total']):>9}{RESET}")
+        proj = s["project"][:29]
+        print(f"  {marker} {label_col}{label:<5}{RESET} {sid[:8]:<9} {proj:<30} {s['model']:<7} {s['calls']:>6,}  {age_str:<10}  {col}{fmt_usd(s['total']):>9}{RESET}")
     if not sorted_sess:
         print(f"  {DIM}no activity today yet{RESET}")
     print()
@@ -373,22 +416,44 @@ def cmd_session(args) -> None:
         sys.exit(1)
     proj_dir, jl = match
     proj = project_slug(proj_dir)
-    print(f"{BOLD}session {jl.stem}{RESET}  project: {proj}\n")
     total = 0.0
     calls = 0
+    first_ts = None
+    last_ts = None
     seen: set[str] = set()
+    rows = []
     for when, model, usage, c in iter_usage_calls(jl, seen):
-        t = when.astimezone().strftime("%H:%M:%S") if when else "??:??:??"
+        rows.append((when, model, usage, c))
         total += c
         calls += 1
+        if when:
+            if first_ts is None or when < first_ts:
+                first_ts = when
+            if last_ts is None or when > last_ts:
+                last_ts = when
+
+    now_utc = datetime.now(timezone.utc)
+    label, label_col, marker = session_state(last_ts, now_utc)
+    duration_str = fmt_duration((last_ts - first_ts).total_seconds()) if (first_ts and last_ts and last_ts > first_ts) else "--"
+    first_str = first_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S") if first_ts else "--"
+    last_str = last_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S") if last_ts else "--"
+    age_str = fmt_age(last_ts, now_utc)
+
+    print(f"{BOLD}session {jl.stem}{RESET}  project: {proj}")
+    print(f"  status: {marker} {label_col}{label}{RESET}  {DIM}(last call {age_str}){RESET}")
+    print(f"  started: {DIM}{first_str}{RESET}    last: {DIM}{last_str}{RESET}    duration: {duration_str}")
+    col = color_for(total, 1, 3)
+    print(f"  calls: {calls:,}    cost: {col}{fmt_usd(total)}{RESET}\n")
+
+    print(f"{BOLD}per-call detail{RESET}")
+    for when, model, usage, c in rows:
+        t = when.astimezone().strftime("%H:%M:%S") if when else "??:??:??"
         inp = usage.get("input_tokens", 0)
         cr = usage.get("cache_read_input_tokens", 0)
         cw = usage.get("cache_creation_input_tokens", 0)
         out = usage.get("output_tokens", 0)
         call_col = GREEN if c < 0.05 else YELLOW if c < 0.25 else RED
         print(f"  {DIM}{t}{RESET}  {model_family(model):<6}  in={inp:>6,}  cache_r={cr:>9,}  cache_w={cw:>7,}  out={out:>6,}  {call_col}{fmt_usd(c)}{RESET}")
-    col = color_for(total, 1, 3)
-    print(f"\n{BOLD}total {col}{fmt_usd(total)}{RESET} across {calls} unique API calls")
 
 
 def cmd_json(args) -> None:
