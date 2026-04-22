@@ -97,11 +97,38 @@ def iter_lines(path: Path, start: int = 0):
         return
 
 
+def iter_usage_calls(jl: Path, seen_ids: set[str], start: int = 0):
+    """Yield (when, model, usage, cost) for unique billed API calls in a jsonl.
+
+    Claude Code writes multiple jsonl entries for one API call (streaming
+    chunks, tool-use splits, etc.). Each carries the same message.id. We
+    dedupe on that id so we only count each call once.
+    """
+    for obj in iter_lines(jl, start):
+        msg = obj.get("message") or {}
+        usage = msg.get("usage")
+        if not usage:
+            continue
+        msg_id = msg.get("id")
+        if msg_id:
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+        model = msg.get("model", "unknown")
+        when = parse_ts(obj.get("timestamp"))
+        yield when, model, usage, cost_of(usage, model)
+
+
 def scan(since: date | None = None, project_filter: str | None = None):
-    """Yield (when, project, session, model, usage, cost_usd) across all jsonl files."""
+    """Yield (when, project, session, model, usage, cost_usd) across all jsonl files.
+
+    Dedupes by message.id globally within this scan — one API call counted once,
+    even if the same message.id appears in multiple jsonl files.
+    """
     if not PROJECTS_DIR.exists():
         return
     cutoff_ts = datetime.combine(since, datetime.min.time()).timestamp() if since else 0
+    seen_ids: set[str] = set()
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
@@ -115,14 +142,8 @@ def scan(since: date | None = None, project_filter: str | None = None):
             except FileNotFoundError:
                 continue
             sess = jl.stem
-            for obj in iter_lines(jl):
-                msg = obj.get("message") or {}
-                usage = msg.get("usage")
-                if not usage:
-                    continue
-                model = msg.get("model", "unknown")
-                when = parse_ts(obj.get("timestamp"))
-                yield when, proj, sess, model, usage, cost_of(usage, model)
+            for when, model, usage, c in iter_usage_calls(jl, seen_ids):
+                yield when, proj, sess, model, usage, c
 
 
 def fmt_usd(x: float) -> str:
@@ -234,6 +255,23 @@ def cmd_watch(args) -> None:
         if when < s["first_ts"]:
             s["first_ts"] = when
 
+    # Re-scan to populate seen_ids so subsequent polls don't recount seeded calls.
+    seen_ids: set[str] = set()
+    for _proj_dir in PROJECTS_DIR.iterdir():
+        if not _proj_dir.is_dir():
+            continue
+        for _jl in _proj_dir.glob("*.jsonl"):
+            try:
+                if _jl.stat().st_mtime < datetime.combine(today, datetime.min.time()).timestamp():
+                    continue
+            except FileNotFoundError:
+                continue
+            for _obj in iter_lines(_jl):
+                _msg = _obj.get("message") or {}
+                _mid = _msg.get("id")
+                if _mid and _msg.get("usage"):
+                    seen_ids.add(_mid)
+
     offsets: dict[Path, int] = {}
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
@@ -267,14 +305,9 @@ def cmd_watch(args) -> None:
                         offsets[jl] = size
                         continue
                     sess_id = jl.stem
-                    for obj in iter_lines(jl, prev):
-                        msg = obj.get("message") or {}
-                        usage = msg.get("usage")
-                        if not usage:
-                            continue
-                        model = msg.get("model", "unknown")
-                        when = parse_ts(obj.get("timestamp")) or datetime.now(timezone.utc)
-                        c = cost_of(usage, model)
+                    for when, model, usage, c in iter_usage_calls(jl, seen_ids, prev):
+                        if when is None:
+                            when = datetime.now(timezone.utc)
                         today_total += c
                         s = sessions.setdefault(sess_id, {
                             "project": proj, "model": model_family(model),
@@ -343,18 +376,9 @@ def cmd_session(args) -> None:
     print(f"{BOLD}session {jl.stem}{RESET}  project: {proj}\n")
     total = 0.0
     calls = 0
-    for obj in iter_lines(jl):
-        msg = obj.get("message") or {}
-        usage = msg.get("usage")
-        if not usage:
-            continue
-        model = msg.get("model", "unknown")
-        ts = obj.get("timestamp") or ""
-        try:
-            t = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M:%S")
-        except Exception:
-            t = "??:??:??"
-        c = cost_of(usage, model)
+    seen: set[str] = set()
+    for when, model, usage, c in iter_usage_calls(jl, seen):
+        t = when.astimezone().strftime("%H:%M:%S") if when else "??:??:??"
         total += c
         calls += 1
         inp = usage.get("input_tokens", 0)
@@ -364,7 +388,7 @@ def cmd_session(args) -> None:
         call_col = GREEN if c < 0.05 else YELLOW if c < 0.25 else RED
         print(f"  {DIM}{t}{RESET}  {model_family(model):<6}  in={inp:>6,}  cache_r={cr:>9,}  cache_w={cw:>7,}  out={out:>6,}  {call_col}{fmt_usd(c)}{RESET}")
     col = color_for(total, 1, 3)
-    print(f"\n{BOLD}total {col}{fmt_usd(total)}{RESET} across {calls} API calls")
+    print(f"\n{BOLD}total {col}{fmt_usd(total)}{RESET} across {calls} unique API calls")
 
 
 def cmd_json(args) -> None:
