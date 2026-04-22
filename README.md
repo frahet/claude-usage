@@ -23,12 +23,38 @@ Zero dependencies — stdlib only. Python 3.10+.
 
 ```bash
 claude-usage                 # today's spend, by model and project
-claude-usage --watch         # live tail: shows new API calls as they happen
+claude-usage --watch         # live dashboard: top sessions, recent calls, today total
 claude-usage --days 7        # daily bar chart of the last N days
 claude-usage --session abcd  # drill into one session (prefix match)
 claude-usage --project tradebot   # filter by project slug substring
 claude-usage --json          # raw output for piping
 ```
+
+### Watch mode — find the culprit live
+
+`--watch` clears the terminal and redraws every few seconds:
+
+```
+claude-usage live   2026-04-22 15:48:12   Franks-MacBook-Air
+  today: $52.30    since watch start: $0.23
+
+TOP SESSIONS TODAY  (● = active in last 60s)
+    SESSION   PROJECT                     MODEL   CALLS   LAST        COST
+  ● 5aeb9d11  -Users-frank                 opus     337   15:48:02   $52.30
+    1a2b3c4d  -Users-frank-projects-forge  sonnet    12   14:33:10    $0.45
+
+RECENT CALLS  (last 10)
+    15:48:02  5aeb9d11  opus    cache_r=91,200  out=  420   $0.18
+    ...
+
+tip: claude-usage --session 5aeb9d11  to drill in · ctrl-c to exit
+```
+
+The `●` marker shows which sessions have fired an API call in the last minute. When a session spikes, copy its ID into `--session` in another terminal to see per-call tokens and cost.
+
+## Per-machine
+
+This tool only sees the machine it runs on. `~/.claude/projects/` is local — each machine writes its own jsonl logs, and they never sync anywhere. To watch a remote machine, run `claude-usage --watch` on it over SSH (inside `tmux` for persistence).
 
 ## What it reports
 

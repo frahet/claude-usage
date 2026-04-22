@@ -20,8 +20,8 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
-from datetime import date, datetime, timedelta
+from collections import defaultdict, deque
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -72,6 +72,18 @@ def project_slug(proj_dir: Path) -> str:
     return name
 
 
+def parse_ts(ts: str | None):
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 def iter_lines(path: Path, start: int = 0):
     try:
         with open(path, "rb") as f:
@@ -109,11 +121,7 @@ def scan(since: date | None = None, project_filter: str | None = None):
                 if not usage:
                     continue
                 model = msg.get("model", "unknown")
-                ts = obj.get("timestamp") or ""
-                try:
-                    when = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-                except Exception:
-                    when = None
+                when = parse_ts(obj.get("timestamp"))
                 yield when, proj, sess, model, usage, cost_of(usage, model)
 
 
@@ -159,9 +167,73 @@ def cmd_today(args) -> None:
         print(f"  {sess[:8]}  {sess_proj[sess][:40]:<40}  {fmt_usd(c)}")
 
 
+def _render_dashboard(sessions: dict, recent: deque, today_total: float, watch_start_total: float) -> None:
+    sys.stdout.write("\x1b[2J\x1b[H")  # clear + home
+    host = os.uname().nodename
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    since_watch = today_total - watch_start_total
+    col_total = color_for(today_total, 5, 15)
+    col_since = color_for(since_watch, 0.5, 2)
+
+    print(f"{BOLD}claude-usage live{RESET}   {DIM}{now_str}   {host}{RESET}")
+    print(f"  today: {col_total}{fmt_usd(today_total)}{RESET}    since watch start: {col_since}{fmt_usd(since_watch)}{RESET}")
+    print()
+
+    active_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+    sorted_sess = sorted(sessions.items(), key=lambda kv: -kv[1]["total"])
+
+    print(f"{BOLD}TOP SESSIONS TODAY{RESET}  {DIM}(● = active in last 60s){RESET}")
+    print(f"    {DIM}{'SESSION':<9} {'PROJECT':<34} {'MODEL':<7} {'CALLS':>6}  {'LAST':<8}  {'COST':>9}{RESET}")
+    for sid, s in sorted_sess[:8]:
+        active = s["last_ts"] and s["last_ts"] > active_cutoff
+        marker = f"{GREEN}●{RESET}" if active else " "
+        last_str = s["last_ts"].astimezone().strftime("%H:%M:%S") if s["last_ts"] else "--:--:--"
+        col = color_for(s["total"], 1, 5)
+        proj = s["project"][:33]
+        print(f"  {marker} {sid[:8]:<9} {proj:<34} {s['model']:<7} {s['calls']:>6,}  {last_str:<8}  {col}{fmt_usd(s['total']):>9}{RESET}")
+    if not sorted_sess:
+        print(f"  {DIM}no activity today yet{RESET}")
+    print()
+
+    print(f"{BOLD}RECENT CALLS{RESET}  {DIM}(last {len(recent)}){RESET}")
+    if not recent:
+        print(f"  {DIM}waiting for new API calls…{RESET}")
+    else:
+        for r in list(recent):
+            ts = r["ts"].astimezone().strftime("%H:%M:%S") if r["ts"] else "??:??:??"
+            col = GREEN if r["cost"] < 0.05 else YELLOW if r["cost"] < 0.25 else RED
+            print(f"  {DIM}{ts}{RESET}  {r['session'][:8]}  {r['model']:<6}  "
+                  f"cache_r={r['cache_r']:>9,}  out={r['output']:>6,}  {col}{fmt_usd(r['cost']):>9}{RESET}")
+    print()
+
+    if sorted_sess:
+        top = sorted_sess[0][0][:8]
+        print(f"{DIM}tip: claude-usage --session {top}  to drill in · ctrl-c to exit{RESET}")
+    else:
+        print(f"{DIM}ctrl-c to exit{RESET}")
+    sys.stdout.flush()
+
+
 def cmd_watch(args) -> None:
     today = date.today()
-    # Seed: total today so far, offsets = current file sizes.
+    sessions: dict[str, dict] = {}
+    today_total = 0.0
+
+    for when, proj, sess, model, _usage, c in scan(since=today, project_filter=args.project):
+        if not (when and when.astimezone().date() == today):
+            continue
+        today_total += c
+        s = sessions.setdefault(sess, {
+            "project": proj, "model": model_family(model),
+            "calls": 0, "total": 0.0, "first_ts": when, "last_ts": when,
+        })
+        s["calls"] += 1
+        s["total"] += c
+        if when > s["last_ts"]:
+            s["last_ts"] = when
+        if when < s["first_ts"]:
+            s["first_ts"] = when
+
     offsets: dict[Path, int] = {}
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
@@ -171,19 +243,14 @@ def cmd_watch(args) -> None:
                 offsets[jl] = jl.stat().st_size
             except FileNotFoundError:
                 continue
-    today_total = sum(
-        c for when, _p, _s, _m, _u, c in scan(since=today, project_filter=args.project)
-        if when and when.date() == today
-    )
 
-    print(f"{DIM}watching {PROJECTS_DIR} — ctrl-c to exit{RESET}")
-    col = color_for(today_total, 5, 15)
-    sys.stdout.write(f"\r{BOLD}today: {col}{fmt_usd(today_total)}{RESET}")
-    sys.stdout.flush()
+    recent: deque = deque(maxlen=12)
+    watch_start_total = today_total
 
     try:
+        _render_dashboard(sessions, recent, today_total, watch_start_total)
         while True:
-            new_calls = []
+            time.sleep(args.interval)
             for proj_dir in PROJECTS_DIR.iterdir():
                 if not proj_dir.is_dir():
                     continue
@@ -199,30 +266,35 @@ def cmd_watch(args) -> None:
                     if size <= prev:
                         offsets[jl] = size
                         continue
+                    sess_id = jl.stem
                     for obj in iter_lines(jl, prev):
                         msg = obj.get("message") or {}
                         usage = msg.get("usage")
                         if not usage:
                             continue
                         model = msg.get("model", "unknown")
+                        when = parse_ts(obj.get("timestamp")) or datetime.now(timezone.utc)
                         c = cost_of(usage, model)
                         today_total += c
-                        new_calls.append((proj, jl.stem[:8], model_family(model), c))
+                        s = sessions.setdefault(sess_id, {
+                            "project": proj, "model": model_family(model),
+                            "calls": 0, "total": 0.0, "first_ts": when, "last_ts": when,
+                        })
+                        s["calls"] += 1
+                        s["total"] += c
+                        s["last_ts"] = when
+                        recent.append({
+                            "ts": when, "session": sess_id, "project": proj,
+                            "model": model_family(model),
+                            "input": usage.get("input_tokens", 0),
+                            "cache_r": usage.get("cache_read_input_tokens", 0),
+                            "output": usage.get("output_tokens", 0),
+                            "cost": c,
+                        })
                     offsets[jl] = size
-
-            if new_calls:
-                sys.stdout.write("\r" + " " * 80 + "\r")
-                ts = datetime.now().strftime("%H:%M:%S")
-                for proj, sess, m, c in new_calls:
-                    call_col = GREEN if c < 0.05 else YELLOW if c < 0.25 else RED
-                    print(f"{DIM}{ts}{RESET}  {proj[:25]:<25} {sess}  {m:<6}  {call_col}{fmt_usd(c)}{RESET}")
-
-            col = color_for(today_total, 5, 15)
-            sys.stdout.write(f"\r{BOLD}today: {col}{fmt_usd(today_total)}{RESET}  ")
-            sys.stdout.flush()
-            time.sleep(args.interval)
+            _render_dashboard(sessions, recent, today_total, watch_start_total)
     except KeyboardInterrupt:
-        print()
+        sys.stdout.write("\x1b[0m\n")
 
 
 def cmd_days(args) -> None:
