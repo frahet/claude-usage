@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-usage"
-version = "0.3.0"
-description = "Parse local Claude Code logs, show token spend per session/project/model/day."
+name = "claude-watch"
+version = "0.4.0"
+description = "Live dashboard + kill switch for Claude Code spend — parses local jsonl logs, shows per-session cost in real time."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Frank Hetland" }]
-keywords = ["claude", "anthropic", "llm", "usage", "tokens", "cost"]
+keywords = ["claude", "anthropic", "llm", "usage", "tokens", "cost", "monitoring"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -22,11 +22,11 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-claude-usage = "claude_usage.cli:main"
+claude-watch = "claude_watch.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/frahet/claude-usage"
-Issues = "https://github.com/frahet/claude-usage/issues"
+Homepage = "https://github.com/frahet/claude-watch"
+Issues = "https://github.com/frahet/claude-watch/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

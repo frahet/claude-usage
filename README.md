@@ -1,77 +1,106 @@
-# claude-usage
+# claude-watch
 
-Parse local Claude Code logs and show how much your sessions actually cost.
-
-No API calls. No cloud. Just reads the `.jsonl` files Claude Code already writes to `~/.claude/projects/`.
+Live dashboard + kill switch for your Claude Code spend. Parses the `.jsonl` session logs Claude Code already writes to `~/.claude/projects/` — no API calls, no cloud.
 
 ## Install
 
-```bash
-pipx install claude-usage
-```
-
-Or grab the single file:
+Single-file, zero dependencies, Python 3.10+:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/frahet/claude-usage/main/src/claude_usage/cli.py \
-  -o /usr/local/bin/claude-usage && chmod +x /usr/local/bin/claude-usage
+sudo curl -fsSL https://raw.githubusercontent.com/frahet/claude-watch/main/src/claude_watch/cli.py \
+  -o /usr/local/bin/claude-watch && sudo chmod +x /usr/local/bin/claude-watch
 ```
 
-Zero dependencies — stdlib only. Python 3.10+.
+Or clone and symlink (so `git pull` picks up updates):
+
+```bash
+git clone https://github.com/frahet/claude-watch.git ~/Documents/projects/claude-watch
+sudo ln -sf ~/Documents/projects/claude-watch/src/claude_watch/cli.py /usr/local/bin/claude-watch
+```
+
+(On Linux hosts without sudo, use `~/.local/bin` instead of `/usr/local/bin`.)
 
 ## Usage
 
 ```bash
-claude-usage                 # today's spend, by model and project
-claude-usage --watch         # live dashboard: top sessions, recent calls, today total
-claude-usage --days 7        # daily bar chart of the last N days
-claude-usage --session abcd  # drill into one session (prefix match)
-claude-usage --project tradebot   # filter by project slug substring
-claude-usage --json          # raw output for piping
+claude-watch                            # today's spend, by model and project
+claude-watch --watch                    # live dashboard
+claude-watch --watch --max-today 20     # circuit breaker: auto-kill LIVE sessions if spend > $20
+claude-watch --days 7                   # daily bar chart
+claude-watch --session abcd             # drill into one session (prefix match)
+claude-watch --project tradebot         # filter by project label
+claude-watch --kill abcd                # SIGTERM the process writing session abcd
+claude-watch --kill abcd --force        # SIGKILL instead
+claude-watch --kill-live                # kill every LIVE session (< 60s activity)
+claude-watch --json                     # machine-readable
+claude-watch --version
 ```
 
-### Watch mode — find the culprit live
+## Live dashboard
 
-`--watch` clears the terminal and redraws every few seconds:
+`--watch` clears the terminal and redraws every 3 seconds:
 
 ```
-claude-usage live   2026-04-22 15:48:12   Franks-MacBook-Air
-  today: $52.30    since watch start: $0.23
+claude-watch live   v0.4.0  2026-04-22 15:48:12  Franks-MacBook-Air
+  today: $12.30    since watch: $0.23    burn: $2.40/hr    cap: $20.00
 
-TOP SESSIONS TODAY  (● = active in last 60s)
-    SESSION   PROJECT                     MODEL   CALLS   LAST        COST
-  ● 5aeb9d11  -Users-frank                 opus     337   15:48:02   $52.30
-    1a2b3c4d  -Users-frank-projects-forge  sonnet    12   14:33:10    $0.45
+TOP SESSIONS TODAY  (LIVE < 60s · IDLE 1–10m · DONE > 10m)
+    STATUS SESSION   PROJECT                 MODEL   CALLS  LAST        COST
+  ● LIVE   5aeb9d11  tradebot-ops            opus      337  just now   $12.30
+  ● IDLE   1a2b3c4d  forge-ferro-hetland     sonnet     12  4m ago      $0.45
+    DONE   9f8e7d6c  ~                       opus      203  2h ago      $1.20
 
-RECENT CALLS  (last 10)
-    15:48:02  5aeb9d11  opus    cache_r=91,200  out=  420   $0.18
-    ...
+RECENT CALLS  (⚠ = cache_r > 200,000)
+  ⚠ 15:48:02  5aeb9d11  opus    cache_r=291,200  out=  420   $0.48
+    15:47:48  5aeb9d11  opus    cache_r= 87,400  out=  112   $0.15
 
-tip: claude-usage --session 5aeb9d11  to drill in · ctrl-c to exit
+tip: claude-watch --session 5aeb9d11 · claude-watch --kill 5aeb9d11 · ctrl-c to exit
 ```
 
-The `●` marker shows which sessions have fired an API call in the last minute. When a session spikes, copy its ID into `--session` in another terminal to see per-call tokens and cost.
+### Meaning
 
-## Per-machine
+- **STATUS** — LIVE (API call in last 60s), IDLE (1–10 min ago), DONE (>10 min)
+- **burn** — extrapolated $/hr from the last 10 minutes of calls
+- **⚠** on a row — that call read more than 200K cached tokens, which usually means context is bloating fast
+- **cap** — only shown when `--max-today $N` is passed
 
-This tool only sees the machine it runs on. `~/.claude/projects/` is local — each machine writes its own jsonl logs, and they never sync anywhere. To watch a remote machine, run `claude-usage --watch` on it over SSH (inside `tmux` for persistence).
+## Circuit breaker
 
-## What it reports
+Leave this in a terminal during any autonomous / overnight run:
 
-For each API call in the local jsonl logs:
-- `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`
-- Detects model family (opus / sonnet / haiku) from `message.model`
-- Multiplies by list prices to give a USD estimate
+```bash
+claude-watch --watch --max-today 20
+```
+
+When today's deduped spend exceeds $20, every LIVE session gets SIGTERM'd and the watch exits. That's the "never again" safeguard.
+
+## Kill a runaway by hand
+
+```bash
+claude-watch --kill 5aeb9d11         # polite SIGTERM (lets Claude Code clean up)
+claude-watch --kill 5aeb9d11 --force # SIGKILL when it won't stop
+claude-watch --kill-live             # nuke everything currently firing
+```
+
+Kill works by finding the PID holding the session's `.jsonl` file open via `lsof`, then sending the signal. If the process has already exited, it's a no-op.
+
+## How cost is calculated
+
+Each assistant message in a jsonl carries a `message.usage` block. We multiply the four token counts (input, output, cache_write, cache_read) by list prices:
+
+```
+opus:   $15 / $75 / $18.75 / $1.50    per MTok
+sonnet: $3  / $15 / $3.75  / $0.30
+haiku:  $1  / $5  / $1.25  / $0.10
+```
+
+Calls are deduped by `message.id` — Claude Code writes the same call to the jsonl multiple times (streaming chunks, tool-use splits), but each should only count once.
 
 ## Caveats
 
-- Cost is at **API list price**. If you're on Claude Max, most of your interactive usage is covered by the flat monthly fee — the reported number is still useful as a relative signal to find which sessions burn the most.
-- Prices are hardcoded in `PRICES` at the top of `cli.py`. Bump them if Anthropic changes rates.
-- Works wherever Claude Code writes to `~/.claude/projects/` — Mac, Linux, WSL.
-
-## Why
-
-Catching a runaway orchestrator in real time is worth more than any post-hoc dashboard. `--watch` in a second terminal shows you the bleed as it happens.
+- **Cost is at API list price.** If you're on Claude Max, most interactive usage is covered by the flat monthly fee — the reported number is still a useful relative signal for finding which sessions burn the most.
+- **Per-machine.** `~/.claude/projects/` is local to each host. Mac sees Mac sessions; remote hosts see their own. Run `claude-watch --watch` over SSH in a `tmux` session to monitor a remote machine.
+- **Prices are hardcoded** in `PRICES` at the top of `cli.py`. Bump them if Anthropic changes rates.
 
 ## License
 
